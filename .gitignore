@@ -1,0 +1,18 @@
+# 1. Bỏ qua toàn bộ Data (Nguyên nhân gây lỗi)
+data/
+
+# 2. Bỏ qua file trọng số sinh ra lúc Train
+checkpoints/
+
+# 3. Bỏ qua file kết quả tạm sinh ra lúc Eval
+eval_result/
+
+# 4. Bỏ qua rác của Python (Cache)
+__pycache__/
+*.pyc
+*.pyo
+
+# 5. Các file log tự sinh (nếu ông có xuất ra)
+*.log
+metrics.csv
+metrics.json
