@@ -231,4 +231,5 @@ def evaluate_entity_level_using_knn(dataset, x_train, x_test, y_test):
     print('FN: {}'.format(fn))
     print('TP: {}'.format(tp))
     print('FP: {}'.format(fp))
-    return auc, 0.0, None, None
+    y_pred = (score >= best_thres).astype(int)
+    return auc, 0.0, y_pred, y_test
