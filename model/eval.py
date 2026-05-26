@@ -185,17 +185,52 @@ def evaluate_batch_level_using_knn(repeat, dataset, embeddings, labels):
 
 
 def evaluate_entity_level_using_knn(dataset, x_train, x_test, y_test):
+    """Entity-level KNN evaluation with a fixed, train-calibrated threshold.
+
+    Important evaluation policy:
+    - AUC is computed on the test labels and does not require a threshold.
+    - Precision/Recall/F1 are computed using a threshold selected ONLY from
+      the benign training-score distribution.
+    - No test labels are used to choose the threshold.
+
+    Environment variables:
+    - MAGIC_TRAIN_THRESHOLD_QUANTILE: primary threshold quantile, default 0.999.
+    - MAGIC_REPORT_QUANTILES: comma-separated sensitivity quantiles, default
+      0.99,0.995,0.999.
+    """
     log('[ENTITY_KNN] start dataset={}'.format(dataset))
     log('[ENTITY_KNN] input x_train shape={}, x_test shape={}, y_test shape={}, positives={}'.format(
-        x_train.shape, x_test.shape, y_test.shape, int(y_test.sum())
+        x_train.shape, x_test.shape, y_test.shape, int(np.sum(y_test))
     ))
 
-    t0 = time.time()
+    primary_quantile = float(os.environ.get('MAGIC_TRAIN_THRESHOLD_QUANTILE', '0.999'))
+    if not 0.0 < primary_quantile < 1.0:
+        raise ValueError('MAGIC_TRAIN_THRESHOLD_QUANTILE must be in (0, 1), got {}'.format(primary_quantile))
+
+    report_quantiles_raw = os.environ.get('MAGIC_REPORT_QUANTILES', '0.99,0.995,0.999')
+    report_quantiles = []
+    for q in report_quantiles_raw.split(','):
+        q = q.strip()
+        if not q:
+            continue
+        qv = float(q)
+        if not 0.0 < qv < 1.0:
+            raise ValueError('MAGIC_REPORT_QUANTILES values must be in (0, 1), got {}'.format(qv))
+        report_quantiles.append(qv)
+    if primary_quantile not in report_quantiles:
+        report_quantiles.append(primary_quantile)
+    report_quantiles = sorted(set(report_quantiles))
+
+    log('[ENTITY_KNN] threshold policy=train_score_quantile')
+    log('[ENTITY_KNN] primary_quantile={}'.format(primary_quantile))
+    log('[ENTITY_KNN] report_quantiles={}'.format(report_quantiles))
+
     log('[ENTITY_KNN] standardizing embeddings')
+    t0 = time.time()
     x_train_mean = x_train.mean(axis=0)
     x_train_std = x_train.std(axis=0)
-    x_train = (x_train - x_train_mean) / x_train_std
-    x_test = (x_test - x_train_mean) / x_train_std
+    x_train = (x_train - x_train_mean) / (x_train_std + 1e-6)
+    x_test = (x_test - x_train_mean) / (x_train_std + 1e-6)
     log('[ENTITY_KNN] standardization done in {:.2f}s'.format(time.time() - t0))
 
     if dataset == 'cadets':
@@ -210,36 +245,53 @@ def evaluate_entity_level_using_knn(dataset, x_train, x_test, y_test):
     nbrs.fit(x_train)
     log('[ENTITY_KNN] fit done in {:.2f}s'.format(time.time() - t0))
 
-    save_dict_path = './eval_result/distance_save_{}.pkl'.format(dataset)
+    q_tag = str(primary_quantile).replace('.', 'p')
+    save_dict_path = './eval_result/distance_save_{}_trainq{}.pkl'.format(dataset, q_tag)
     log('[ENTITY_KNN] distance cache path={}'.format(save_dict_path))
 
     if not os.path.exists(save_dict_path):
         log('[ENTITY_KNN] no cache found; computing distances')
+
         idx = list(range(x_train.shape[0]))
         random.shuffle(idx)
-
         train_sample_size = min(50000, x_train.shape[0])
-        log('[ENTITY_KNN] computing train sample distances: sample_size={}'.format(train_sample_size))
-        t0 = time.time()
-        distances, _ = nbrs.kneighbors(x_train[idx][:train_sample_size], n_neighbors=n_neighbors)
-        log('[ENTITY_KNN] train sample distances done in {:.2f}s'.format(time.time() - t0))
+        train_sample_idx = idx[:train_sample_size]
 
-        del x_train
-        mean_distance = distances.mean()
+        log('[ENTITY_KNN] computing train calibration distances: sample_size={}'.format(train_sample_size))
+        t0 = time.time()
+        train_distances, _ = nbrs.kneighbors(x_train[train_sample_idx], n_neighbors=n_neighbors)
+        log('[ENTITY_KNN] train calibration distances done in {:.2f}s'.format(time.time() - t0))
+
+        mean_distance = train_distances.mean()
+        train_scores = train_distances.mean(axis=1) / mean_distance
         log('[ENTITY_KNN] mean_distance={}'.format(mean_distance))
-        del distances
+        log('[ENTITY_KNN] train_score min={:.6f}, max={:.6f}, mean={:.6f}'.format(
+            float(np.min(train_scores)), float(np.max(train_scores)), float(np.mean(train_scores))
+        ))
+
+        del train_distances
+        del x_train
 
         log('[ENTITY_KNN] computing test distances for {} samples'.format(x_test.shape[0]))
         t0 = time.time()
-        distances, _ = nbrs.kneighbors(x_test, n_neighbors=n_neighbors)
+        test_distances, _ = nbrs.kneighbors(x_test, n_neighbors=n_neighbors)
         log('[ENTITY_KNN] test distances done in {:.2f}s'.format(time.time() - t0))
 
-        save_dict = [mean_distance, distances.mean(axis=1)]
-        distances = distances.mean(axis=1)
+        score = test_distances.mean(axis=1) / mean_distance
+        del test_distances
+
+        save_dict = {
+            'mean_distance': mean_distance,
+            'train_scores': train_scores,
+            'score': score,
+            'primary_quantile': primary_quantile,
+            'report_quantiles': report_quantiles,
+            'n_neighbors': n_neighbors,
+            'threshold_policy': 'train_score_quantile',
+        }
 
         log('[ENTITY_KNN] saving distance cache')
         t0 = time.time()
-        os.makedirs(os.path.dirname(save_dict_path), exist_ok=True)
         with open(save_dict_path, 'wb') as f:
             pkl.dump(save_dict, f)
         log('[ENTITY_KNN] cache saved in {:.2f}s'.format(time.time() - t0))
@@ -247,94 +299,81 @@ def evaluate_entity_level_using_knn(dataset, x_train, x_test, y_test):
         log('[ENTITY_KNN] loading cached distances')
         t0 = time.time()
         with open(save_dict_path, 'rb') as f:
-            mean_distance, distances = pkl.load(f)
+            save_dict = pkl.load(f)
+        mean_distance = save_dict['mean_distance']
+        train_scores = save_dict['train_scores']
+        score = save_dict['score']
         log('[ENTITY_KNN] cache loaded in {:.2f}s'.format(time.time() - t0))
 
-    log('[ENTITY_KNN] computing anomaly scores')
-    score = distances / mean_distance
-    del distances
+    log('[ENTITY_KNN] score min={:.6f}, max={:.6f}, mean={:.6f}'.format(
+        float(np.min(score)), float(np.max(score)), float(np.mean(score))
+    ))
 
     log('[ENTITY_KNN] computing ROC-AUC and PR curve')
     t0 = time.time()
     auc = roc_auc_score(y_test, score)
-    prec, rec, threshold = precision_recall_curve(y_test, score)
-    f1 = 2 * prec * rec / (rec + prec + 1e-9)
+    prec_curve, rec_curve, threshold_curve = precision_recall_curve(y_test, score)
+    f1_curve = 2 * prec_curve * rec_curve / (rec_curve + prec_curve + 1e-9)
     log('[ENTITY_KNN] metrics curves computed in {:.2f}s'.format(time.time() - t0))
-    log('[ENTITY_KNN] len(score)={}, len(threshold)={}, len(f1)={}'.format(len(score), len(threshold), len(f1)))
+    log('[ENTITY_KNN] len(score)={}, len(threshold_curve)={}, len(f1_curve)={}'.format(
+        len(score), len(threshold_curve), len(f1_curve)
+    ))
 
-    # NOTE:
-    # precision_recall_curve returns len(threshold) == len(prec) - 1.
-    # The final precision/recall point has no corresponding threshold, so all
-    # threshold-based selections must use only f1[:len(threshold)].
-    #
-    # The original MAGIC code hard-coded recall targets for trace/theia/cadets
-    # to reproduce the paper's peak performance. New entity-level datasets such
-    # as fivedirections do not match any of those branches; previously best_idx
-    # stayed -1, which selected the last threshold and could make recall/F1 zero.
-    if len(threshold) == 0:
-        raise ValueError('precision_recall_curve returned no thresholds; check y_test and score.')
+    # This is reported only as diagnostic separability information. It is not
+    # used for the final test-set Precision/Recall/F1 because it uses y_test.
+    if len(threshold_curve) > 0:
+        valid_f1 = f1_curve[:len(threshold_curve)]
+        oracle_idx = int(np.argmax(valid_f1))
+        print('ORACLE_MAX_F1_DEBUG_ONLY: threshold={} precision={} recall={} f1={}'.format(
+            threshold_curve[oracle_idx], prec_curve[oracle_idx], rec_curve[oracle_idx], valid_f1[oracle_idx]
+        ), flush=True)
 
-    valid_f1 = f1[:len(threshold)]
+    def confusion_at_threshold(thres):
+        y_pred_local = (score >= thres).astype(int)
+        tp = int(np.sum((y_test == 1.0) & (y_pred_local == 1)))
+        fn = int(np.sum((y_test == 1.0) & (y_pred_local == 0)))
+        tn = int(np.sum((y_test == 0.0) & (y_pred_local == 0)))
+        fp = int(np.sum((y_test == 0.0) & (y_pred_local == 1)))
+        precision = tp / (tp + fp + 1e-9)
+        recall = tp / (tp + fn + 1e-9)
+        f1_score = 2 * precision * recall / (precision + recall + 1e-9)
+        return y_pred_local, precision, recall, f1_score, tn, fn, tp, fp
 
-    recall_targets = {
-        'trace': 0.99979,
-        'theia': 0.99996,
-        'cadets': 0.9976,
-    }
+    log('[ENTITY_KNN] evaluating fixed train-quantile operating points')
+    primary_result = None
+    primary_threshold = None
 
-    threshold_selection = 'max_f1'
-    best_idx = -1
+    for q in report_quantiles:
+        thres = float(np.quantile(train_scores, q))
+        y_pred_q, precision_q, recall_q, f1_q, tn_q, fn_q, tp_q, fp_q = confusion_at_threshold(thres)
+        print(
+            'OPERATING_POINT: threshold_source=train_scores quantile={} threshold={} '
+            'precision={} recall={} f1={} TN={} FN={} TP={} FP={}'.format(
+                q, thres, precision_q, recall_q, f1_q, tn_q, fn_q, tp_q, fp_q
+            ),
+            flush=True
+        )
+        if abs(q - primary_quantile) < 1e-12:
+            primary_result = (y_pred_q, precision_q, recall_q, f1_q, tn_q, fn_q, tp_q, fp_q)
+            primary_threshold = thres
 
-    if dataset in recall_targets:
-        # Keep the original paper-reproduction behavior for known datasets.
-        target_recall = recall_targets[dataset]
-        for i in range(len(threshold)):
-            if rec[i] < target_recall:
-                best_idx = max(i - 1, 0)
-                threshold_selection = 'target_recall_{}'.format(target_recall)
-                break
+    if primary_result is None:
+        primary_threshold = float(np.quantile(train_scores, primary_quantile))
+        primary_result = confusion_at_threshold(primary_threshold)
 
-    if best_idx < 0:
-        # Safe fallback for new datasets, e.g. fivedirections.
-        # This uses labels to choose a threshold, so it is appropriate for
-        # debugging/model-separability checks. For final strict evaluation,
-        # choose this threshold on a validation/calibration split instead.
-        best_idx = int(np.argmax(valid_f1))
-        if dataset not in recall_targets:
-            threshold_selection = 'max_f1_new_dataset'
-        else:
-            threshold_selection = 'max_f1_fallback'
+    y_pred, precision, recall, f1_score, tn, fn, tp, fp = primary_result
 
-    best_thres = threshold[best_idx]
-    print('THRESHOLD_SELECTION: {}'.format(threshold_selection), flush=True)
-    print('BEST_THRESHOLD: {}'.format(best_thres), flush=True)
-    print('BEST_INDEX: {}'.format(best_idx), flush=True)
-
-    log('[ENTITY_KNN] building confusion matrix counts')
-    t0 = time.time()
-    tn = 0
-    fn = 0
-    tp = 0
-    fp = 0
-    for i in range(len(y_test)):
-        if y_test[i] == 1.0 and score[i] >= best_thres:
-            tp += 1
-        if y_test[i] == 1.0 and score[i] < best_thres:
-            fn += 1
-        if y_test[i] == 0.0 and score[i] < best_thres:
-            tn += 1
-        if y_test[i] == 0.0 and score[i] >= best_thres:
-            fp += 1
-    log('[ENTITY_KNN] confusion counts done in {:.2f}s'.format(time.time() - t0))
-
+    print('THRESHOLD_SELECTION: train_quantile_{}'.format(primary_quantile), flush=True)
+    print('BEST_THRESHOLD: {}'.format(primary_threshold), flush=True)
+    print('BEST_INDEX: {}'.format('N/A_train_quantile'), flush=True)
     print('AUC: {}'.format(auc), flush=True)
-    print('F1: {}'.format(f1[best_idx]), flush=True)
-    print('PRECISION: {}'.format(prec[best_idx]), flush=True)
-    print('RECALL: {}'.format(rec[best_idx]), flush=True)
+    print('F1: {}'.format(f1_score), flush=True)
+    print('PRECISION: {}'.format(precision), flush=True)
+    print('RECALL: {}'.format(recall), flush=True)
     print('TN: {}'.format(tn), flush=True)
     print('FN: {}'.format(fn), flush=True)
     print('TP: {}'.format(tp), flush=True)
     print('FP: {}'.format(fp), flush=True)
-    y_pred = (score >= best_thres).astype(int)
     log('[ENTITY_KNN] done')
+
     return auc, 0.0, y_pred, y_test
